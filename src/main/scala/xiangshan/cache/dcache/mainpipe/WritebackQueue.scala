@@ -16,12 +16,11 @@
 
 package xiangshan.cache
 
-import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.tilelink.TLPermissions._
 import freechips.rocketchip.tilelink.{TLArbiter, TLBundleC, TLBundleD, TLEdgeOut}
-import coupledL2.DirtyKey
+import org.chipsalliance.cde.config.Parameters
 import utils.{HasPerfEvents, HasTLDump, XSDebug, XSPerfAccumulate}
 
 class WritebackReqCtrl(implicit p: Parameters) extends DCacheBundle {
@@ -96,7 +95,7 @@ class ReleaseUpdate(implicit p: Parameters) extends DCacheBundle {
 }
 
 // To reduce fanout, writeback queue entry data is updated 1 cycle
-// after ReleaseUpdate.fire()
+// after ReleaseUpdate.fire
 class WBQEntryReleaseUpdate(implicit p: Parameters) extends DCacheBundle {
   // only consider store here
   val addr = UInt(PAddrBits.W)
@@ -137,6 +136,7 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
   val state = RegInit(s_invalid)
   val state_dup_0 = RegInit(s_invalid)
   val state_dup_1 = RegInit(s_invalid)
+  val state_dup_for_mp = RegInit(VecInit(Seq.fill(nDupWbReady)(s_invalid)))
 
   val remain = RegInit(0.U(refillCycles.W))
   val remain_dup_0 = RegInit(0.U(refillCycles.W))
@@ -155,6 +155,11 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
   val paddr_dup_1 = Reg(UInt(PAddrBits.W))
   val paddr_dup_2 = Reg(UInt(PAddrBits.W))
 
+  // pending data write
+  // !s_data_override means there is an in-progress data write
+  // val s_data_override = RegInit(true.B)
+  // !s_data_merge means there is an in-progress data merge
+  // val s_data_merge = RegInit(true.B)
 
   val busy = remain.orR
 
@@ -188,6 +193,9 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
   
     remain_set := Mux(io.req.bits.hasData, ~0.U(refillCycles.W), 1.U(refillCycles.W))
     state      := s_release_req
+    state_dup_0 := s_release_req
+    state_dup_1 := s_release_req
+    state_dup_for_mp.foreach(_ := s_release_req)
   }
 
   // --------------------------------------------------------------------------------
@@ -239,6 +247,7 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
   io.mem_release.bits  := Mux(req.voluntary,
     Mux(req.hasData, voluntaryReleaseData, voluntaryRelease),
     Mux(req.hasData, probeResponseData, probeResponse))
+
   
   when (io.mem_release.fire()) {remain_clr := PriorityEncoderOH(remain_dup_1)}
 
@@ -246,22 +255,29 @@ class WritebackEntry(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
 
   when(state === s_release_req && release_done){
     state := Mux(req.voluntary, s_release_resp, s_invalid)
+    when(req.voluntary){
+      state_dup_for_mp.foreach(_ := s_release_resp)
+    } .otherwise{
+      state_dup_for_mp.foreach(_ := s_invalid)
+    }
   }
 
   io.primary_ready := state === s_invalid
+  io.primary_ready_dup.zip(state_dup_for_mp).foreach { case (rdy, st) => rdy := st === s_invalid }
   // --------------------------------------------------------------------------------
   // receive ReleaseAck for Releases
   when (state === s_release_resp) {
     io.mem_grant.ready := true.B
     when (io.mem_grant.fire()) {
       state := s_invalid
+      state_dup_for_mp.foreach(_ := s_invalid)
     }
   }
   when((req.hasData || RegNext(alloc))) {
     data := io.req_data.data
   }
   // performance counters
-  XSPerfAccumulate("wb_req", io.req.fire())
+  XSPerfAccumulate("wb_req", io.req.fire)
   XSPerfAccumulate("wb_release", state === s_release_req && release_done && req.voluntary)
   XSPerfAccumulate("wb_probe_resp", state === s_release_req && release_done && !req.voluntary)
   XSPerfAccumulate("penalty_blocked_by_channel_C", io.mem_release.valid && !io.mem_release.ready)
@@ -358,11 +374,11 @@ class WritebackQueue(edge: TLEdgeOut)(implicit p: Parameters) extends DCacheModu
   }
 
   // performance counters
-  XSPerfAccumulate("wb_req", io.req.fire())
+  XSPerfAccumulate("wb_req", io.req.fire)
 
   val perfValidCount = RegNext(PopCount(entries.map(e => e.io.block_addr.valid)))
   val perfEvents = Seq(
-    ("dcache_wbq_req      ", io.req.fire()),
+    ("dcache_wbq_req      ", io.req.fire),
     ("dcache_wbq_1_4_valid", (perfValidCount < (cfg.nReleaseEntries.U/4.U))),
     ("dcache_wbq_2_4_valid", (perfValidCount > (cfg.nReleaseEntries.U/4.U)) & (perfValidCount <= (cfg.nReleaseEntries.U/2.U))),
     ("dcache_wbq_3_4_valid", (perfValidCount > (cfg.nReleaseEntries.U/2.U)) & (perfValidCount <= (cfg.nReleaseEntries.U*3.U/4.U))),
